@@ -1,0 +1,11 @@
+# KEEP THESE IGNORE RULES
+node_modules/
+.env
+.DS_Store
+
+# SPECIFICALLY IGNORE CREDENTIAL FILES (not all JSON)
+/serviceAccountKey*.json
+/*.txt
+
+# ALLOW package.json by NOT ignoring it
+# Remove any line that says *.json or package.json
