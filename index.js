@@ -2,29 +2,30 @@ require('dotenv').config();
 const admin = require("firebase-admin");
 const moment = require("moment-timezone");
 const http = require('http');
+const fs = require('fs');
 
 // Set timezone to Asia/Kolkata
 process.env.TZ = 'Asia/Kolkata';
 
-// Parse credentials from environment variables
-const serviceAccountPrimary = JSON.parse(process.env.FIREBASE_PRIMARY_CREDENTIALS);
-const serviceAccountSecondary = JSON.parse(process.env.FIREBASE_SECONDARY_CREDENTIALS);
+// Load service account keys
+const serviceAccountKey = JSON.parse(fs.readFileSync("./serviceAccountKey.json"));
+const serviceAccountKeySecondary = JSON.parse(fs.readFileSync("./serviceAccountKeySecondary.json"));
 
-// Initialize Firebase apps
+// Firebase App Initialization
 const primaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountPrimary),
+  credential: admin.credential.cert(serviceAccountKey),
   databaseURL: "https://esp32-90eef-default-rtdb.firebaseio.com/"
 }, "primary");
 
 const secondaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountSecondary),
+  credential: admin.credential.cert(serviceAccountKeySecondary),
   databaseURL: "https://backup-attendance-default-rtdb.firebaseio.com/"
 }, "secondary");
 
 const primaryDB = primaryApp.database();
 const secondaryDB = secondaryApp.database();
 
-// ID → Roll Map
+// Maps
 const rollMap = {
   "1": "2907", "2": "2908", "3": "2909", "4": "2910", "5": "2911", "6": "2912",
   "7": "2913", "8": "2914", "9": "2915", "10": "2916", "11": "2917", "12": "2918",
@@ -39,7 +40,7 @@ const rollMap = {
   "63": "2969", "64": "3287", "65": "3286"
 };
 
-// Roll → Name Map
+
 const nameMap = {
   "2907": "AARUSH JEIMEN M", "2908": "ABINASH MICHEL M", "2909": "ABINESH F", "2910": "ABISHA P",
   "2911": "ABISHA R", "2912": "ADLIN DINO T", "2913": "AKISHA S G", "2914": "AKSHAYA S",
@@ -59,8 +60,11 @@ const nameMap = {
   "2969": "YOSUVA JOBIN M", "3287": "GOPI V R", "3286": "JAIJOTHI K"
 };
 
+// Track last reset date
+let lastResetDate = "";
+
 function syncData() {
-  const today = moment().tz('Asia/Kolkata').format("YYYY-MM-DD");
+  const today = moment().format("YYYY-MM-DD");
   const primaryRef = primaryDB.ref("/");
 
   primaryRef.once("value", (snapshot) => {
@@ -75,17 +79,15 @@ function syncData() {
       const name = nameMap[roll] || "Unknown";
       const { hour, minute, pre } = entry;
 
-      // Determine session
       let session = null;
       if (hour === 255 || pre === 0) {
-        session = null; // Absent
+        session = null;
       } else if (hour < 12) {
         session = "FN";
       } else if (hour >= 12 && hour < 17) {
         session = "AN";
       }
 
-      // Initialize student if not in result yet
       if (!result[roll]) {
         result[roll] = {
           name,
@@ -96,61 +98,146 @@ function syncData() {
 
       if (session) {
         const entryTime = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-        const late = hour > 9 || (hour === 9 && minute > 10);
+        const entryMoment = moment({ hour, minute });
+
+        // Define present/late thresholds
+        const isFN = session === "FN";
+        const isAN = session === "AN";
+
+        let status = "Absent"; // default fallback
+
+        if (isFN) {
+          const start = moment({ hour: 8, minute: 30 });
+          const presentCutoff = moment({ hour: 9, minute: 10 });
+          const lateCutoff = moment({ hour: 12, minute: 0 });
+
+          if (entryMoment.isBetween(start, presentCutoff, null, "[)")) {
+            status = "Present";
+          } else if (entryMoment.isBetween(presentCutoff, lateCutoff, null, "[)")) {
+            status = "Late";
+          }
+        }
+
+        if (isAN) {
+          const start = moment({ hour: 12, minute: 30 });
+          const presentCutoff = moment({ hour: 13, minute: 15 });
+          const lateCutoff = moment({ hour: 16, minute: 0 });
+
+          if (entryMoment.isBetween(start, presentCutoff, null, "[)")) {
+            status = "Present";
+          } else if (entryMoment.isBetween(presentCutoff, lateCutoff, null, "[)")) {
+            status = "Late";
+          }
+        }
+
         result[roll][session] = {
-          status: late ? "Late" : "Present",
-          entry_time: entryTime
+          status,
+          entry_time: entryMoment.format("HH:mm")
         };
+
       }
     });
 
-    // Save to secondary DB
     const secondaryRef = secondaryDB.ref(today);
-    secondaryRef.set(result, (err) => {
-      if (err) {
-        console.error(`[${new Date().toISOString()}] ❌ Failed to sync:`, err.message);
-      } else {
-        console.log(`[${new Date().toISOString()}] ✅ Synced successfully for ${today}`);
+
+// First, fetch existing attendance to avoid overwriting
+secondaryRef.once("value", (existingSnap) => {
+  const existingData = existingSnap.val() || {};
+
+  // Merge result with existingData
+  Object.keys(result).forEach((roll) => {
+    if (!existingData[roll]) {
+      existingData[roll] = result[roll]; // new record
+    } else {
+      // Update only the specific session (FN/AN) without overwriting the other
+      existingData[roll].name = result[roll].name; // always update name (safe)
+      if (result[roll].FN && result[roll].FN.status !== "Absent") {
+        existingData[roll].FN = result[roll].FN;
       }
-    });
+      if (result[roll].AN && result[roll].AN.status !== "Absent") {
+        existingData[roll].AN = result[roll].AN;
+      }
+    }
+  });
+
+  // Write merged data back to DB
+  secondaryRef.set(existingData, (err) => {
+    if (err) {
+      console.error("❌ Failed to sync (merged):", err);
+    } else {
+      console.log("✅ Synced successfully with session merge for", today);
+    }
+  });
+});
+
   });
 }
 
-// Create HTTP server for Render keep-alive
+function updatePrimaryDataAtEvening() {
+  const now = moment().tz("Asia/Kolkata");
+  const currentTime = now.format("HH:mm");
+
+  if (currentTime === "15:30") {
+    const dataRef = primaryDB.ref("data");
+    dataRef.set(1, (err) => {
+      if (err) {
+        console.error("❌ Failed to update 'data' key in primary DB:", err);
+      } else {
+        console.log("🌆 'data' key in primary DB updated to 1 at 3:30 PM");
+      }
+    });
+  }
+}
+
+function resetAllPreValuesAtMidnight() {
+  const now = moment().tz("Asia/Kolkata");
+  const currentDate = now.format("YYYY-MM-DD");
+  const currentTime = now.format("HH:mm");
+
+  if (currentTime === "00:30" && lastResetDate !== currentDate) {
+    const primaryRef = primaryApp.database().ref("/");
+    primaryRef.once("value", (snapshot) => {
+      const data = snapshot.val();
+      for (const key in data) {
+        if (data[key] && typeof data[key] === "object" && data[key].hasOwnProperty("pre")) {
+          primaryRef.child(key).update({ pre: 0 });
+        }
+      }
+      console.log("🔄 Reset all 'pre' values to 0 at midnight.");
+      lastResetDate = currentDate;
+    });
+  }
+}
+
+// Create HTTP server (keep-alive for Render)
 const server = http.createServer((req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/plain'});
-  res.end('Firebase Sync Service Running\n');
-  
-  // Log request to show activity
-  console.log(`[${new Date().toISOString()}] Received keep-alive request`);
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('✅ Firebase Sync Service Running\n');
+  console.log(`[${new Date().toISOString()}] 🛠 Keep-alive request received`);
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`);
-  
+  console.log(`[${new Date().toISOString()}] 🚀 Server started on port ${PORT}`);
+
   // Initial sync
   syncData();
-  
-  // Schedule regular syncs every 5 minutes
-  setInterval(syncData, 5 * 60 * 1000);
-  
-  // Prevent Render sleep with internal pings
+
+  // Periodic tasks
   setInterval(() => {
-    console.log(`[${new Date().toISOString()}] Instance keep-alive ping`);
-    syncData(); // Extra sync for safety
-  }, 14 * 60 * 1000); // 14 minutes
+    syncData();
+    updatePrimaryDataAtEvening();
+    resetAllPreValuesAtMidnight();
+  }, 60 * 1000); // every 1 minute
 });
 
-// Graceful shutdown handling
+// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log(`[${new Date().toISOString()}] Shutting down gracefully`);
-  server.close(() => {
-    process.exit(0);
-  });
+  console.log(`[${new Date().toISOString()}] 🧹 Shutting down gracefully`);
+  server.close(() => process.exit(0));
 });
 
-// Error handling for uncaught exceptions
+// Catch uncaught errors
 process.on('uncaughtException', (err) => {
   console.error(`[${new Date().toISOString()}] ⚠️ Uncaught Exception:`, err.message);
 });
