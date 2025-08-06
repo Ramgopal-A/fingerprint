@@ -2,23 +2,22 @@ require('dotenv').config();
 const admin = require("firebase-admin");
 const moment = require("moment-timezone");
 const http = require('http');
-const fs = require('fs');
 
 // Set timezone to Asia/Kolkata
 process.env.TZ = 'Asia/Kolkata';
 
-// Load service account keys
-const serviceAccountKey = JSON.parse(fs.readFileSync("./serviceAccountKey.json"));
-const serviceAccountKeySecondary = JSON.parse(fs.readFileSync("./serviceAccountKeySecondary.json"));
+// Parse credentials from environment variables
+const serviceAccountPrimary = JSON.parse(process.env.FIREBASE_PRIMARY_CREDENTIALS);
+const serviceAccountSecondary = JSON.parse(process.env.FIREBASE_SECONDARY_CREDENTIALS);
 
-// Firebase App Initialization
+// Initialize Firebase apps
 const primaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountKey),
+  credential: admin.credential.cert(serviceAccountPrimary),
   databaseURL: "https://esp32-90eef-default-rtdb.firebaseio.com/"
 }, "primary");
 
 const secondaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountKeySecondary),
+  credential: admin.credential.cert(serviceAccountSecondary),
   databaseURL: "https://backup-attendance-default-rtdb.firebaseio.com/"
 }, "secondary");
 
