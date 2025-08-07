@@ -193,7 +193,7 @@ function resetAllPreValuesAtMidnight() {
   const currentDate = now.format("YYYY-MM-DD");
   const currentTime = now.format("HH:mm");
 
-  if (currentTime === "00:30" && lastResetDate !== currentDate) {
+  if (currentTime === "00:00" && lastResetDate !== currentDate) {
     const primaryRef = primaryApp.database().ref("/");
     primaryRef.once("value", (snapshot) => {
       const data = snapshot.val();
