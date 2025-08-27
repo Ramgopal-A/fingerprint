@@ -11,8 +11,8 @@ const TZ = 'Asia/Kolkata';
 process.env.TZ = TZ;
 
 // Load service account keys (files must exist)
-const serviceAccountKey = JSON.parse(fs.readFileSync('./serviceAccountKey.json'));
-const serviceAccountKeySecondary = JSON.parse(fs.readFileSync('./serviceAccountKeySecondary.json'));
+const serviceAccountKey = JSON.parse(process.env.FIREBASE_PRIMARY_CREDENTIALS);
+const serviceAccountKeySecondary = JSON.parse(process.env.FIREBASE_SECONDARY_CREDENTIALS);
 
 // Replace with your real DB URLs or set in environment variables
 const PRIMARY_DB_URL = process.env.PRIMARY_DB_URL || 'https://esp32-90eef-default-rtdb.firebaseio.com/';
