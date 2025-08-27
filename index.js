@@ -1,30 +1,38 @@
+// index.js
 require('dotenv').config();
-const admin = require("firebase-admin");
-const moment = require("moment-timezone");
+const admin = require('firebase-admin');
+const moment = require('moment-timezone');
 const http = require('http');
+const fs = require('fs');
 
-// Set timezone to Asia/Kolkata
-process.env.TZ = 'Asia/Kolkata';
+// --- CONFIG ---
+// Set timezone
+const TZ = 'Asia/Kolkata';
+process.env.TZ = TZ;
 
-// Parse credentials from environment variables
-const serviceAccountPrimary = JSON.parse(process.env.FIREBASE_PRIMARY_CREDENTIALS);
-const serviceAccountSecondary = JSON.parse(process.env.FIREBASE_SECONDARY_CREDENTIALS);
+// Load service account keys (files must exist)
+const serviceAccountKey = JSON.parse(fs.readFileSync('./serviceAccountKey.json'));
+const serviceAccountKeySecondary = JSON.parse(fs.readFileSync('./serviceAccountKeySecondary.json'));
+
+// Replace with your real DB URLs or set in environment variables
+const PRIMARY_DB_URL = process.env.PRIMARY_DB_URL || 'https://esp32-90eef-default-rtdb.firebaseio.com/';
+const SECONDARY_DB_URL = process.env.SECONDARY_DB_URL || 'https://backup-attendance-default-rtdb.firebaseio.com/';
 
 // Initialize Firebase apps
 const primaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountPrimary),
-  databaseURL: "https://esp32-90eef-default-rtdb.firebaseio.com/"
-}, "primary");
+  credential: admin.credential.cert(serviceAccountKey),
+  databaseURL: PRIMARY_DB_URL
+}, 'primary');
 
 const secondaryApp = admin.initializeApp({
-  credential: admin.credential.cert(serviceAccountSecondary),
-  databaseURL: "https://backup-attendance-default-rtdb.firebaseio.com/"
-}, "secondary");
+  credential: admin.credential.cert(serviceAccountKeySecondary),
+  databaseURL: SECONDARY_DB_URL
+}, 'secondary');
 
 const primaryDB = primaryApp.database();
 const secondaryDB = secondaryApp.database();
 
-// Maps
+// --- Student / Roll maps (use your full map) ---
 const rollMap = {
   "1": "2907", "2": "2908", "3": "2909", "4": "2910", "5": "2911", "6": "2912",
   "7": "2913", "8": "2914", "9": "2915", "10": "2916", "11": "2917", "12": "2918",
@@ -38,7 +46,6 @@ const rollMap = {
   "56": "2962", "57": "2963", "58": "2964", "59": "2965", "60": "2966", "61": "2967",
   "63": "2969", "64": "3287", "65": "3286"
 };
-
 
 const nameMap = {
   "2907": "AARUSH JEIMEN M", "2908": "ABINASH MICHEL M", "2909": "ABINESH F", "2910": "ABISHA P",
@@ -59,184 +66,270 @@ const nameMap = {
   "2969": "YOSUVA JOBIN M", "3287": "GOPI V R", "3286": "JAIJOTHI K"
 };
 
-// Track last reset date
-let lastResetDate = "";
+// --- Utilities ---
+function now() {
+  return moment().tz(TZ);
+}
 
-function syncData() {
-  const today = moment().format("YYYY-MM-DD");
-  const primaryRef = primaryDB.ref("/");
+function timeStringFromHM(h, m) {
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
 
-  primaryRef.once("value", (snapshot) => {
-    const data = snapshot.val();
+// --- Main sync function ---
+// This reads the primary DB root, determines Present/Late/Absent for FN & AN
+// and merges non-absent session results into secondary DB under today's date.
+async function syncData() {
+  const t = now();
+  const currentTime = t.format('HH:mm');
+
+  // Only run syncing process between 08:00 and 15:00 (inclusive start, inclusive end)
+  const startWork = moment.tz({ hour: 8, minute: 0 }, TZ);
+  const endWork = moment.tz({ hour: 15, minute: 0 }, TZ);
+
+  if (t.isBefore(startWork) || t.isAfter(endWork)) {
+    console.log(`⏸ [${currentTime}] Outside working window (08:00-15:00). Skipping sync.`);
+    return;
+  }
+
+  const today = t.format('YYYY-MM-DD');
+  try {
+    const snapshot = await primaryDB.ref('/').once('value');
+    const data = snapshot.val() || {};
+
+    // Start with default Absent for all students
     const result = {};
-
-    Object.keys(data).forEach((key) => {
-      const entry = data[key];
-      if (!rollMap[key] || !entry || typeof entry.pre === "undefined") return;
-
+    Object.keys(rollMap).forEach(key => {
       const roll = rollMap[key];
-      const name = nameMap[roll] || "Unknown";
-      const { hour, minute, pre } = entry;
+      result[roll] = {
+        name: nameMap[roll] || 'Unknown',
+        FN: { status: 'Absent' },
+        AN: { status: 'Absent' }
+      };
+    });
 
-      let session = null;
-      if (hour === 255 || pre === 0) {
-        session = null;
-      } else if (hour < 12) {
-        session = "FN";
-      } else if (hour >= 12 && hour < 17) {
-        session = "AN";
+    // Process each record from primary DB
+    Object.keys(data).forEach(k => {
+      const entry = data[k];
+      if (!rollMap[k] || !entry) return;
+
+      const roll = rollMap[k];
+      // Expect fields: pre (0/1), hour (0-23 or 255), minute
+      const pre = typeof entry.pre === 'undefined' ? 0 : entry.pre;
+      const hour = typeof entry.hour === 'undefined' ? 255 : entry.hour;
+      const minute = typeof entry.minute === 'undefined' ? 0 : entry.minute;
+
+      if (pre !== 1) return;      // not scanned / not present
+      if (hour === 255) return;   // invalid hour flag from device
+
+      const entryMoment = moment.tz({ hour, minute }, TZ);
+
+      // FN: any hour < 12
+      if (hour < 12) {
+        const fnStart = moment.tz({ hour: 8, minute: 0 }, TZ);
+        const fnPresentEnd = moment.tz({ hour: 9, minute: 10 }, TZ); // present cutoff
+        const fnLateEnd = moment.tz({ hour: 12, minute: 0 }, TZ);    // FN session end
+
+        if (entryMoment.isBetween(fnStart, fnPresentEnd, null, '[)')) {
+          result[roll].FN = { status: 'Present', entry_time: entryMoment.format('HH:mm') };
+        } else if (entryMoment.isBetween(fnPresentEnd, fnLateEnd, null, '[)')) {
+          result[roll].FN = { status: 'Late', entry_time: entryMoment.format('HH:mm') };
+        }
+        // else remains Absent
       }
 
-      if (!result[roll]) {
-        result[roll] = {
-          name,
-          FN: { status: "Absent" },
-          AN: { status: "Absent" }
-        };
-      }
+      // AN: hour >= 12
+      if (hour >= 12) {
+        const anPresentStart = moment.tz({ hour: 12, minute: 35 }, TZ);
+        const anPresentEnd = moment.tz({ hour: 13, minute: 15 }, TZ);
+        const anLateEnd = moment.tz({ hour: 15, minute: 0 }, TZ);
 
-      if (session) {
-        const entryTime = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-        const entryMoment = moment({ hour, minute });
-
-        // Define present/late thresholds
-        const isFN = session === "FN";
-        const isAN = session === "AN";
-
-        let status = "Absent"; // default fallback
-
-        if (isFN) {
-          const start = moment({ hour: 8, minute: 30 });
-          const presentCutoff = moment({ hour: 9, minute: 10 });
-          const lateCutoff = moment({ hour: 12, minute: 0 });
-
-          if (entryMoment.isBetween(start, presentCutoff, null, "[)")) {
-            status = "Present";
-          } else if (entryMoment.isBetween(presentCutoff, lateCutoff, null, "[)")) {
-            status = "Late";
-          }
+        if (entryMoment.isBetween(anPresentStart, anPresentEnd, null, '[)')) {
+          result[roll].AN = { status: 'Present', entry_time: entryMoment.format('HH:mm') };
+        } else if (entryMoment.isBetween(anPresentEnd, anLateEnd, null, '[)')) {
+          result[roll].AN = { status: 'Late', entry_time: entryMoment.format('HH:mm') };
         }
-
-        if (isAN) {
-          const start = moment({ hour: 12, minute: 30 });
-          const presentCutoff = moment({ hour: 13, minute: 15 });
-          const lateCutoff = moment({ hour: 16, minute: 0 });
-
-          if (entryMoment.isBetween(start, presentCutoff, null, "[)")) {
-            status = "Present";
-          } else if (entryMoment.isBetween(presentCutoff, lateCutoff, null, "[)")) {
-            status = "Late";
-          }
-        }
-
-        result[roll][session] = {
-          status,
-          entry_time: entryMoment.format("HH:mm")
-        };
-
+        // else remains Absent
       }
     });
 
-    const secondaryRef = secondaryDB.ref(today);
+    // Merge result into secondary DB under today's date.
+    const secRef = secondaryDB.ref(`/${today}`);
+    const existingSnap = await secRef.once('value');
+    const existing = existingSnap.val() || {};
 
-// First, fetch existing attendance to avoid overwriting
-secondaryRef.once("value", (existingSnap) => {
-  const existingData = existingSnap.val() || {};
-
-  // Merge result with existingData
-  Object.keys(result).forEach((roll) => {
-    if (!existingData[roll]) {
-      existingData[roll] = result[roll]; // new record
-    } else {
-      // Update only the specific session (FN/AN) without overwriting the other
-      existingData[roll].name = result[roll].name; // always update name (safe)
-      if (result[roll].FN && result[roll].FN.status !== "Absent") {
-        existingData[roll].FN = result[roll].FN;
-      }
-      if (result[roll].AN && result[roll].AN.status !== "Absent") {
-        existingData[roll].AN = result[roll].AN;
-      }
-    }
-  });
-
-  // Write merged data back to DB
-  secondaryRef.set(existingData, (err) => {
-    if (err) {
-      console.error("❌ Failed to sync (merged):", err);
-    } else {
-      console.log("✅ Synced successfully with session merge for", today);
-    }
-  });
-});
-
-  });
-}
-
-function updatePrimaryDataAtEvening() {
-  const now = moment().tz("Asia/Kolkata");
-  const currentTime = now.format("HH:mm");
-
-  if (currentTime === "15:30") {
-    const dataRef = primaryDB.ref("data");
-    dataRef.set(1, (err) => {
-      if (err) {
-        console.error("❌ Failed to update 'data' key in primary DB:", err);
+    Object.keys(result).forEach(roll => {
+      if (!existing[roll]) {
+        existing[roll] = result[roll];
       } else {
-        console.log("🌆 'data' key in primary DB updated to 1 at 3:30 PM");
-      }
-    });
-  }
-}
-
-function resetAllPreValuesAtMidnight() {
-  const now = moment().tz("Asia/Kolkata");
-  const currentDate = now.format("YYYY-MM-DD");
-  const currentTime = now.format("HH:mm");
-
-  if (currentTime === "00:00" && lastResetDate !== currentDate) {
-    const primaryRef = primaryApp.database().ref("/");
-    primaryRef.once("value", (snapshot) => {
-      const data = snapshot.val();
-      for (const key in data) {
-        if (data[key] && typeof data[key] === "object" && data[key].hasOwnProperty("pre")) {
-          primaryRef.child(key).update({ pre: 0 });
+        // Always keep/overwrite name
+        existing[roll].name = result[roll].name;
+        // Only overwrite FN/AN if status is not Absent (so we don't revert an earlier Present)
+        if (result[roll].FN && result[roll].FN.status !== 'Absent') {
+          existing[roll].FN = result[roll].FN;
+        }
+        if (result[roll].AN && result[roll].AN.status !== 'Absent') {
+          existing[roll].AN = result[roll].AN;
         }
       }
-      console.log("🔄 Reset all 'pre' values to 0 at midnight.");
-      lastResetDate = currentDate;
     });
+
+    await secRef.set(existing);
+    console.log(`✅ [${currentTime}] Synced attendance to secondary DB for ${today}`);
+  } catch (err) {
+    console.error(`❌ [${t.format('HH:mm')}] Sync failed:`, err);
   }
 }
 
-// Create HTTP server (keep-alive for Render)
+// --- Finalize functions ---
+// At 12:00 mark FN Absent for anyone who still doesn't have FN recorded.
+// At 15:00 mark AN Absent for anyone who still doesn't have AN recorded.
+async function finalizeSessionIfNeeded() {
+  const t = now();
+  const today = t.format('YYYY-MM-DD');
+  const hh = t.hours();
+  const mm = t.minutes();
+
+  try {
+    const secRef = secondaryDB.ref(`/${today}`);
+    const snap = await secRef.once('value');
+    const existing = snap.val() || {};
+
+    // helper to ensure student node exists
+    function ensureStudent(roll) {
+      if (!existing[roll]) {
+        existing[roll] = {
+          name: nameMap[roll] || 'Unknown',
+          FN: { status: 'Absent' },
+          AN: { status: 'Absent' }
+        };
+      } else {
+        existing[roll].name = nameMap[roll] || existing[roll].name || 'Unknown';
+        if (!existing[roll].FN) existing[roll].FN = { status: 'Absent' };
+        if (!existing[roll].AN) existing[roll].AN = { status: 'Absent' };
+      }
+    }
+
+    // Finalize FN at exactly 12:00 (we'll run at 12:00 or soon after)
+    if (hh === 12 && mm === 0) {
+      Object.values(rollMap).forEach(roll => {
+        ensureStudent(roll);
+        if (!existing[roll].FN || existing[roll].FN.status === undefined || existing[roll].FN.status === null) {
+          existing[roll].FN = { status: 'Absent', entry_time: '--:--' };
+        } else if (existing[roll].FN.status === 'Absent' && !existing[roll].FN.entry_time) {
+          existing[roll].FN.entry_time = '--:--';
+        }
+      });
+      await secRef.set(existing);
+      console.log(`🕛 FN finalized (marked Absent where missing) for ${today}`);
+    }
+
+    // Finalize AN at exactly 15:00
+    if (hh === 15 && mm === 0) {
+      Object.values(rollMap).forEach(roll => {
+        ensureStudent(roll);
+        if (!existing[roll].AN || existing[roll].AN.status === undefined || existing[roll].AN.status === null) {
+          existing[roll].AN = { status: 'Absent', entry_time: '--:--' };
+        } else if (existing[roll].AN.status === 'Absent' && !existing[roll].AN.entry_time) {
+          existing[roll].AN.entry_time = '--:--';
+        }
+      });
+      await secRef.set(existing);
+      console.log(`🕒 AN finalized (marked Absent where missing) for ${today}`);
+    }
+  } catch (err) {
+    console.error('❌ Finalize session error:', err);
+  }
+}
+
+// --- Reset primary DB pre/hour/minute at 00:30 ---
+let lastResetDay = null;
+async function resetPrimaryPreHourMinute() {
+  const t = now();
+  const today = t.format('YYYY-MM-DD');
+  const hh = t.hours();
+  const mm = t.minutes();
+
+  if (hh === 16 && mm === 0 && lastResetDay !== today) {
+    try {
+      const rootSnap = await primaryDB.ref('/').once('value');
+      const data = rootSnap.val() || {};
+      const updates = {};
+
+      Object.keys(data).forEach(k => {
+        if (data[k] && typeof data[k] === 'object') {
+          // Only update when those keys exist (and avoid overwriting unrelated fields).
+          updates[`/${k}/pre`] = 0;
+          updates[`/${k}/hour`] = 255;   // using 255 as invalid hour flag (same as earlier)
+          updates[`/${k}/minute`] = 0;
+        }
+      });
+
+      // Apply updates in one multi-path update
+      if (Object.keys(updates).length > 0) {
+        await primaryDB.ref('/').update(updates);
+      }
+
+      lastResetDay = today;
+      console.log(`🔄 Primary DB reset (pre/hour/minute) at 16:00 for ${today}`);
+    } catch (err) {
+      console.error('❌ Reset primary DB error:', err);
+    }
+  }
+}
+
+// --- At 16:00 add { data: 1 } in main root of secondary DB ---
+let lastDataFlagDay = null;
+async function writeDailyDataFlag() {
+  const t = now();
+  const today = t.format('YYYY-MM-DD');
+  const hh = t.hours();
+  const mm = t.minutes();
+
+  // 16:00 condition
+  if (hh === 16 && mm === 0 && lastDataFlagDay !== today) {
+    try {
+      await primaryDB.ref("/").update({ data: 1 });  // write at root, not under date
+      lastDataFlagDay = today;
+      console.log(`📌 Wrote { data: 1 } to secondary DB root at 16:00`);
+    } catch (err) {
+      console.error('❌ Failed to write daily data flag:', err);
+    }
+  }
+}
+
+
+// --- Periodic loop (runs every minute) ---
+async function periodicTasks() {
+  try {
+    await syncData();                 // runs only during 08:00-15:00
+    await finalizeSessionIfNeeded();  // finalize at 12:00 and 15:00
+    await resetPrimaryPreHourMinute();// reset at 00:30
+    await writeDailyDataFlag();       // write flag at 16:00
+  } catch (err) {
+    console.error('❌ periodicTasks error:', err);
+  }
+}
+
+// Start server for keep-alive (useful for Render/Heroku style hosts)
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('✅ Firebase Sync Service Running\n');
-  console.log(`[${new Date().toISOString()}] 🛠 Keep-alive request received`);
+  res.end('✅ Attendance Sync Service Running\n');
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] 🚀 Server started on port ${PORT}`);
-
-  // Initial sync
-  syncData();
-
-  // Periodic tasks
-  setInterval(() => {
-    syncData();
-    updatePrimaryDataAtEvening();
-    resetAllPreValuesAtMidnight();
-  }, 60 * 1000); // every 1 minute
+  console.log(`🚀 Server started on port ${PORT} (${TZ})`);
+  // Run once immediately, then every minute
+  periodicTasks();
+  setInterval(periodicTasks, 60 * 1000);
 });
 
-// Graceful shutdown
+// graceful shutdown
 process.on('SIGTERM', () => {
-  console.log(`[${new Date().toISOString()}] 🧹 Shutting down gracefully`);
+  console.log('🧹 SIGTERM received, shutting down');
   server.close(() => process.exit(0));
 });
-
-// Catch uncaught errors
 process.on('uncaughtException', (err) => {
-  console.error(`[${new Date().toISOString()}] ⚠️ Uncaught Exception:`, err.message);
+  console.error('⚠️ Uncaught Exception:', err);
+  // do not exit so host can attempt restart; adjust policy if desired
 });
